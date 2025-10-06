@@ -14,7 +14,7 @@ This script automates the process of:
 
 ### System Requirements
 - **Operating System**: Debian/Ubuntu or Red Hat/CentOS
-- **Root Access**: Script must be run as root
+- **Root Access**: Script must be run as root on the gitlab host
 - **Internet Connectivity**: Required for Let's Encrypt certificate requests
 
 ### GitLab Requirements
