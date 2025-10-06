@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
-GitLab Environment Variable Manager
+GitLab Environment Variable Manager with SSL options
 
-Manages CI/CD variables for GitLab projects. Supports export, import, diff, and push operations.
-Based on conventions from bitbucket-env-mgr.
-
-Usage:
-    gitlab-env-mgr.py -p PROJECT_ID -o variables.json        # Export all variables
-    gitlab-env-mgr.py -p PROJECT_ID -i variables.json        # Import variables
-    gitlab-env-mgr.py -p PROJECT_ID -d variables.json        # Diff against current
-    gitlab-env-mgr.py -p PROJECT_ID --push variables.json    # Push variables (import with force)
+Enhanced version with SSL certificate handling for self-hosted GitLab instances.
 """
 
 import argparse
@@ -18,11 +11,11 @@ import logging
 import os
 import sys
 import requests
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
-import difflib
 from dotenv import load_dotenv
+import urllib3
 
 # Constants
 GITLAB_API_VERSION = "v4"
@@ -30,14 +23,32 @@ DEFAULT_ENV_FILE = "gitlab.env"
 LOG_FILE = "gitlab_env_mgr.log"
 
 class GitLabVariableManager:
-    """Manages GitLab CI/CD variables via API"""
+    """Manages GitLab CI/CD variables via API with SSL options"""
     
-    def __init__(self, base_url: str, token: str, project_id: str):
+    def __init__(self, base_url: str, token: str, project_id: str, verify_ssl: bool = True, ca_bundle: Optional[str] = None):
         self.base_url = base_url.rstrip('/')
         self.token = token
         self.project_id = project_id
         self.api_url = f"{self.base_url}/api/{GITLAB_API_VERSION}/projects/{project_id}/variables"
         self.headers = {"PRIVATE-TOKEN": token}
+        
+        # SSL Configuration
+        self.verify_ssl = verify_ssl
+        self.ca_bundle = ca_bundle
+        
+        # Setup SSL verification
+        if not verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            self.verify = False
+        elif ca_bundle:
+            self.verify = ca_bundle
+        else:
+            self.verify = True
+            
+        # Setup session
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.session.verify = self.verify
         
         # Setup logging
         self.logger = logging.getLogger('GitLabVariableManager')
@@ -47,7 +58,7 @@ class GitLabVariableManager:
         self.logger.info(f"Fetching variables from project {self.project_id}")
         
         try:
-            response = requests.get(self.api_url, headers=self.headers)
+            response = self.session.get(self.api_url)
             response.raise_for_status()
             variables = response.json()
             self.logger.info(f"Retrieved {len(variables)} variables")
@@ -73,7 +84,7 @@ class GitLabVariableManager:
             data["description"] = variable["description"]
         
         try:
-            response = requests.post(self.api_url, headers=self.headers, json=data)
+            response = self.session.post(self.api_url, json=data)
             response.raise_for_status()
             self.logger.info(f"Successfully created variable: {variable['key']}")
             return True
@@ -94,7 +105,7 @@ class GitLabVariableManager:
         }
         
         try:
-            response = requests.put(url, headers=self.headers, json=data)
+            response = self.session.put(url, json=data)
             response.raise_for_status()
             self.logger.info(f"Successfully updated variable: {variable['key']}")
             return True
@@ -109,7 +120,7 @@ class GitLabVariableManager:
         url = f"{self.api_url}/{key}"
         
         try:
-            response = requests.delete(url, headers=self.headers)
+            response = self.session.delete(url)
             response.raise_for_status()
             self.logger.info(f"Successfully deleted variable: {key}")
             return True
@@ -215,7 +226,7 @@ class GitLabVariableManager:
                 added.append(key)
             elif key in current_vars and key not in file_vars:
                 removed.append(key)
-            elif key in both:
+            elif key in file_vars and key in current_vars:
                 # Check if values differ
                 file_var = file_vars[key]
                 current_var = current_vars[key]
@@ -290,15 +301,15 @@ def setup_logging(verbose: bool, log_file: Optional[str] = None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GitLab CI/CD Variable Manager",
+        description="GitLab CI/CD Variable Manager with SSL support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   Export all variables:
     %(prog)s -p 12345 -o variables.json
     
-  Export with masked values:
-    %(prog)s -p 12345 -o variables.json --include-masked
+  Export with self-signed certificate:
+    %(prog)s -p 12345 -o variables.json --no-verify-ssl
     
   Import variables:
     %(prog)s -p 12345 -i variables.json
@@ -309,8 +320,8 @@ Examples:
   Push variables (sync):
     %(prog)s -p 12345 --push variables.json
     
-  Using environment file:
-    %(prog)s -e gitlab.env -p 12345 -o variables.json
+  Using custom CA certificate:
+    %(prog)s -p 12345 -o variables.json --ca-bundle /path/to/ca-cert.pem
 """
     )
     
@@ -334,6 +345,13 @@ Examples:
                      help='Show differences between current and file variables')
     ops.add_argument('--push', metavar='FILE',
                      help='Push variables from file (sync, removes extras)')
+    
+    # SSL Options
+    ssl_group = parser.add_argument_group('SSL options')
+    ssl_group.add_argument('--no-verify-ssl', action='store_true',
+                          help='Disable SSL certificate verification (use for self-signed certs)')
+    ssl_group.add_argument('--ca-bundle', metavar='PATH',
+                          help='Path to CA certificate bundle file')
     
     # Options
     parser.add_argument('--include-masked', action='store_true',
@@ -365,9 +383,19 @@ Examples:
         logger.error("GitLab URL and token are required. Set via arguments or environment file.")
         sys.exit(1)
         
-    # Create manager
+    # SSL configuration warning
+    if args.no_verify_ssl:
+        logger.warning("SSL certificate verification is disabled. This is insecure!")
+        
+    # Create manager with SSL options
     try:
-        manager = GitLabVariableManager(gitlab_url, token, args.project_id)
+        manager = GitLabVariableManager(
+            gitlab_url, 
+            token, 
+            args.project_id,
+            verify_ssl=not args.no_verify_ssl,
+            ca_bundle=args.ca_bundle
+        )
         
         # Execute operation
         if args.export:
