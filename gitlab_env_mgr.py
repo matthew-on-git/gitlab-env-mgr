@@ -52,12 +52,13 @@ class SSLConfig:
 class GitLabConfig:
     """Configuration for GitLab API connection."""
 
-    def __init__(self, base_url: str, token: str, project_id: str,
+    def __init__(self, base_url: str, token: str, project_identifier: str,
                  ssl_config: Optional[SSLConfig] = None):
         self.base_url = base_url.rstrip('/')
         self.token = token
-        self.project_id = project_id
         self.ssl_config = ssl_config or SSLConfig()
+        # Resolve project identifier to project ID
+        self.project_id = self.resolve_project_id(project_identifier)
 
     def get_api_url(self) -> str:
         """Get the full API URL for the project."""
@@ -66,6 +67,86 @@ class GitLabConfig:
     def get_headers(self) -> Dict[str, str]:
         """Get the headers for API requests."""
         return {"PRIVATE-TOKEN": self.token}
+    
+    def resolve_project_id(self, project_identifier: str) -> str:
+        """Resolve project identifier to project ID.
+        
+        Args:
+            project_identifier: Either a project ID (numeric) or project path/name
+            
+        Returns:
+            Project ID as string
+            
+        Raises:
+            ValueError: If project not found
+        """
+        # If it's already a numeric ID, return it
+        if project_identifier.isdigit():
+            return project_identifier
+            
+        # Get all projects and search locally for better matching
+        search_url = f"{self.base_url}/api/{GITLAB_API_VERSION}/projects"
+        params = {"per_page": 100, "order_by": "name", "sort": "asc"}
+        
+        session = requests.Session()
+        session.headers.update(self.get_headers())
+        session.verify = self.ssl_config.get_verify_setting()
+        
+        try:
+            response = session.get(search_url, params=params)
+            response.raise_for_status()
+            projects = response.json()
+            
+            # Look for exact match first (case-sensitive)
+            for project in projects:
+                if (project.get("path_with_namespace") == project_identifier or 
+                    project.get("name") == project_identifier):
+                    return str(project["id"])
+            
+            # Look for case-insensitive match
+            for project in projects:
+                if (project.get("path_with_namespace", "").lower() == project_identifier.lower() or 
+                    project.get("name", "").lower() == project_identifier.lower()):
+                    return str(project["id"])
+            
+            # Look for partial match
+            for project in projects:
+                if (project_identifier.lower() in project.get("path_with_namespace", "").lower() or 
+                    project_identifier.lower() in project.get("name", "").lower()):
+                    return str(project["id"])
+            
+            # If no match found, show available projects
+            if projects:
+                available = [f"{p['path_with_namespace']} (ID: {p['id']})" for p in projects[:10]]
+                raise ValueError(
+                    f"Project '{project_identifier}' not found. "
+                    f"Available projects: {', '.join(available)}"
+                )
+            else:
+                raise ValueError(f"No projects found matching '{project_identifier}'")
+                
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Failed to search for project: {e}")
+    
+    def list_projects(self) -> List[Dict]:
+        """List all accessible projects.
+        
+        Returns:
+            List of project dictionaries
+        """
+        search_url = f"{self.base_url}/api/{GITLAB_API_VERSION}/projects"
+        params = {"per_page": 100, "order_by": "name", "sort": "asc"}
+        
+        session = requests.Session()
+        session.headers.update(self.get_headers())
+        session.verify = self.ssl_config.get_verify_setting()
+        
+        try:
+            response = session.get(search_url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Failed to list projects: {e}")
 
 
 class GitLabVariableManager:
@@ -341,23 +422,32 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Export all variables:
+  List available projects:
+    %(prog)s --list-projects
+    
+  Export all variables (using project ID):
     %(prog)s -p 12345 -o variables.json
-
+    
+  Export all variables (using project name):
+    %(prog)s -p "my-project" -o variables.json
+    
+  Export all variables (using project path):
+    %(prog)s -p "group/my-project" -o variables.json
+    
   Export with self-signed certificate:
-    %(prog)s -p 12345 -o variables.json --no-verify-ssl
-
+    %(prog)s -p "my-project" -o variables.json --no-verify-ssl
+    
   Import variables:
-    %(prog)s -p 12345 -i variables.json
-
+    %(prog)s -p "my-project" -i variables.json
+    
   Show differences:
-    %(prog)s -p 12345 -d variables.json
-
+    %(prog)s -p "my-project" -d variables.json
+    
   Push variables (sync):
-    %(prog)s -p 12345 --push variables.json
-
+    %(prog)s -p "my-project" --push variables.json
+    
   Using custom CA certificate:
-    %(prog)s -p 12345 -o variables.json --ca-bundle /path/to/ca-cert.pem
+    %(prog)s -p "my-project" -o variables.json --ca-bundle /path/to/ca-cert.pem
 """
     )
 
@@ -370,8 +460,8 @@ Examples:
     parser.add_argument('-t', '--token', help='GitLab personal access token (overrides env file)')
 
     # Project
-    parser.add_argument('-p', '--project-id', required=True,
-                        help='GitLab project ID or path (e.g., 12345 or group/project)')
+    parser.add_argument('-p', '--project-id',
+                        help='GitLab project ID, name, or path (e.g., 12345, "my-project", or "group/project")')
 
     # Operations (mutually exclusive)
     ops = parser.add_mutually_exclusive_group(required=True)
@@ -383,6 +473,8 @@ Examples:
                      help='Show differences between current and file variables')
     ops.add_argument('--push', metavar='FILE',
                      help='Push variables from file (sync, removes extras)')
+    ops.add_argument('--list-projects', action='store_true',
+                     help='List available projects (no project ID needed)')
 
     # SSL Options
     ssl_group = parser.add_argument_group('SSL options')
@@ -420,20 +512,44 @@ Examples:
     if not gitlab_url or not token:
         logger.error("GitLab URL and token are required. Set via arguments or environment file.")
         sys.exit(1)
-
+        
     # SSL configuration warning
     if args.no_verify_ssl:
         logger.warning("SSL certificate verification is disabled. This is insecure!")
-
+        
+    # Create SSL config
+    ssl_config = SSLConfig(
+        verify_ssl=not args.no_verify_ssl,
+        ca_bundle=args.ca_bundle
+    )
+    
+    # Handle list-projects option
+    if args.list_projects:
+        try:
+            # Create a minimal config for listing projects
+            temp_config = GitLabConfig(gitlab_url, token, "1", ssl_config=ssl_config)
+            projects = temp_config.list_projects()
+            
+            print("\n=== Available Projects ===")
+            for project in projects:
+                print(f"ID: {project['id']:>3} | {project['path_with_namespace']}")
+            print(f"\nTotal: {len(projects)} projects")
+            return
+            
+        except Exception as e:
+            logger.error("Failed to list projects: %s", e)
+            sys.exit(1)
+    
+    # Validate project ID is provided for other operations
+    if not args.project_id:
+        logger.error("Project ID is required for this operation. Use --list-projects to see available projects.")
+        sys.exit(1)
+        
     # Create manager with SSL options
     try:
-        ssl_config = SSLConfig(
-            verify_ssl=not args.no_verify_ssl,
-            ca_bundle=args.ca_bundle
-        )
         config = GitLabConfig(
-            gitlab_url,
-            token,
+            gitlab_url, 
+            token, 
             args.project_id,
             ssl_config=ssl_config
         )
